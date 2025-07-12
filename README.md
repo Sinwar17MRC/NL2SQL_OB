@@ -1,11 +1,4 @@
----
-tags:
-  - Planning
-  - Report
-  - Documentation
-  - NL2SQL
-Date_of_creation: 2025-07-07
----
+# **NL2SQL PLAN**
 
 ### **Table of Contents**
 
