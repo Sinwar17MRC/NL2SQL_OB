@@ -303,7 +303,7 @@ The Wide World Importers database is available in two distinct versions, which a
 - **Purpose:** This will be the **primary database for the entire project**. Its complexity is representative of a real-world operational database.
 
 
-![[daba.png]]
+![Database](NL2SQL_Assets/Pics/daba.png)
 
 **Version 2: The Data Warehouse (WideWorldImportersDW)**
 
@@ -323,7 +323,7 @@ To work with this database, we need the **SQL Server** database management sys
         
 - **Outcome:** This setup provides a fully functional, industry-standard SQL Server database that is private to the development machine and can be started, stopped, and removed cleanly.
 
-    ![Project logo](assets/logo.png)
+    ![Docker COntainer](NL2SQL_Assets/Pics/docker_interface_1.png)
 
 ---
 #### **4. Phased Development Workflow with the Database**
