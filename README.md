@@ -216,6 +216,7 @@ The project will be developed iteratively. This approach allows for rapid protot
             └── data_formatter.py      # Helper functions, e.g., for formatting DB results
 </code></pre>
 </div>
+
 ---
 #### *Phase 2: The Full MVP (Presentation Layer & UI)
 
