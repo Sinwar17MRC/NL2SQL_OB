@@ -2,7 +2,9 @@
 .env
 
 #backend
-backend/.venv
+backend/.venv/
+
+
 backend/__pycache__/
 
 
