@@ -10,7 +10,7 @@ app = FastAPI(
 
 # plugin the endpoints router
 app.include_router(
-    endpoints.router,
+    Endpoints.router,
     prefix="/v1" 
 )
 
