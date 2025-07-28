@@ -1,4 +1,4 @@
-from sqlalchemy import create_engine, inspect
+from sqlalchemy import create_engine, inspect, text 
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import SQLAlchemyError
 from typing import Dict, List, Any
@@ -31,46 +31,16 @@ class SchemaManager:
             raise ConnectionError(f"Database connection failed. Check URL/credentials. Error: {e}")
 
     def _get_table_row_count(self, schema_name: str, table_name: str) -> int:
-        """
-        Get row count with multiple fallback methods and better debugging.
-        """
+        """Simple row counting function"""
         try:
-            with self.engine.connect() as connection:
-                row_count = 0
-                
-                if 'mssql' in str(self.engine.url):
-                    # Method 1: Try sys.partitions 
-                    try:
-                        query1 = text(f"""
-                        SELECT SUM(p.rows) as row_count
-                        FROM sys.tables t
-                        INNER JOIN sys.partitions p ON t.object_id = p.object_id
-                        INNER JOIN sys.schemas s ON t.schema_id = s.schema_id
-                        WHERE s.name = '{schema_name}' 
-                        AND t.name = '{table_name}'
-                        AND p.index_id IN (0,1)
-                        """)
-                        result = connection.execute(query1)
-                        row_count = result.fetchone()[0]
-                        if row_count and row_count > 0:
-                            print(f"Row count for {schema_name}.{table_name}: {row_count:,} (sys.partitions)")
-                            return int(row_count)
-                    except Exception as e:
-                        print(f"sys.partitions failed for {schema_name}.{table_name}: {e}")
-                    
-                    # Method 2: Try direct count (slower but accurate)
-                    try:
-                        query2 = text(f'SELECT COUNT(*) as row_count FROM [{schema_name}].[{table_name}]')
-                        result = connection.execute(query2)
-                        row_count = result.fetchone()[0]
-                        print(f"Row count for {schema_name}.{table_name}: {row_count:,} (direct count)")
-                        return int(row_count) if row_count else 0
-                    except Exception as e:
-                        print(f"Direct count failed for {schema_name}.{table_name}: {e}")
+           with self.engine.connect() as connection:
+                query = text(f'SELECT COUNT(*) FROM [{schema_name}].[{table_name}]')
+                result = connection.execute(query)
+                row_count = result.fetchone()[0]
+                return int(row_count) if row_count else 0
         except Exception as e:
-            print(f"All row count methods failed for {schema_name}.{table_name}: {e}")
-        
-        return 0
+            print(f"Row count failed for {schema_name}.{table_name}: {e}")
+            return 0
     
     def get_schema_overview(self) -> Dict[str, Any]:
         """
