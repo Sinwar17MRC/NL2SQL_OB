@@ -4,7 +4,7 @@ from typing import List, Dict, Any
 # REQUEST MODELS
 class DBConnectionRequest(BaseModel):
     """
-    A model to verify db connection request.
+    The model to verify db connection request.
     FastAPI will ensure the incoming JSON has a 'db_url' key and its value is a string.
     """
     db_url: str = Field(
@@ -24,8 +24,7 @@ class NLQueryRequest(BaseModel):
         example="Show me the top 5 customers by total sales.",
         description="The nl question from the user."
     )
-    db_connection: DBConnectionRequest
-
+    connection_id: str
 
 # RESPONSE MODELS 
 
@@ -35,7 +34,19 @@ class ConnectionTestResponse(BaseModel):
     """
     status: str = "success"
     message: str = "Connection successful and schema retrieved."
-    schema: Dict[str, Any] 
+    database_name: str
+    connection_id: str  # Session identifier
+
+class SchemaOverviewResponse(BaseModel):
+    """Lightweight schema for sidebar display in the UI"""
+    database_name: str
+    connection_status: str = "connected"
+    table_count: int
+    tables: List[Dict[str, Any]]  # Just table names + primary keys
+
+class SchemaDetailedResponse(BaseModel):
+    """Full schema for detailed view or LLM context."""
+    schema: Dict[str, Any]  # Full detailed schema
 
 class QueryDataResponse(BaseModel):
     """

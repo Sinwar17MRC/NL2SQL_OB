@@ -1,79 +1,146 @@
 from fastapi import APIRouter, HTTPException, Body
-from ..models import DBConnectionRequest, NLQueryRequest, ConnectionTestResponse, QueryDataResponse
+from ..models import DBConnectionRequest, NLQueryRequest, ConnectionTestResponse, QueryDataResponse, SchemaOverviewResponse, SchemaDetailedResponse
+from ...services.Schema_manager import SchemaManager
+import uuid
 
-# After we develop the AI-agents actual logic, the code here will start like this:
-# from ..services import schema_manager
-# from ..core import pipeline
+# After we develop the AI-agents actual logic, the code here will continue like this:
+# from ...core import pipeline
 
 
 
 router = APIRouter()
 
 
+# Store active connections per session
+active_connections = {}  # This is a simple in-memory store. In production, i'll use redis.
 
-@router.post(
-    "/test-connection",
-    response_model=ConnectionTestResponse,
-    tags=["1. Database Connection"]
-)
+
+@router.post("/test-connection", response_model=ConnectionTestResponse, tags=["1. Database Connection"])
 def test_db_connection(request: DBConnectionRequest):
     """
-    Tests the database connection using the provided connection string.
+    Quick connection test to validate credentials.
+    Returns minimal info for UI .
     """
-    
-    print(f"Received request to test connection for: {request.db_url[:50]}...") # Log first 50 chars
+    print(f"Testing connection to: {request.db_url[:50]}...")
     
     try:
-        # Here I'll implement the full logic later like :
-        # schema_data = schema_manager.test_connection_and_get_schema(request.db_url)
+        schema_manager = SchemaManager(request.db_url)
+        schema_manager.test_connection()
         
-        # For now, I'll return a sample response to test the API structure.
-        mock_schema_data = {
-            "tables": [
-                {"name": "Sales.Customers", "columns": ["CustomerID", "FirstName"]},
-                {"name": "Sales.Orders", "columns": ["OrderID", "OrderDate"]}
-            ]
-        }
+        # Generate session ID and store connection
+        connection_id = str(uuid.uuid4())
+        active_connections[connection_id] = schema_manager
         
-        return ConnectionTestResponse(schema=mock_schema_data)
-
+        # Extract database name from URL  
+        db_name = schema_manager.engine.url.database or "Unknown"
+        
+        return ConnectionTestResponse(
+            status="success",
+            message="Database connection established",
+            database_name=db_name,
+            connection_id=connection_id
+        )
+        
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Connection failed: {str(e)}")
+        raise HTTPException(status_code=400, detail=str(e))
 
 
-@router.post(
-    "/query",
-    response_model=QueryDataResponse,
-    tags=["2. Core Query Pipeline"]
-)
-def process_nl_query(request: NLQueryRequest):
-
+@router.get("/schema/overview", response_model=SchemaOverviewResponse,  tags=["2. Database Introspection"])
+def get_schema_overview(connection_id: str):
     """
-    Receives the user's question and DB credentials,
-    and returns the generated SQL and the resulting data.
+    Lightweight schema for sidebar - just table names and primary keys.
+    Perfect for your sidebar display.
     """
-
-
-    print(f"Received query: '{request.question}'")
+    if connection_id not in active_connections:
+        raise HTTPException(status_code=404, detail="Connection not found")
+    
+    schema_manager = active_connections[connection_id]
     
     try:
-        # Sample logic to run the query pipeline : 
-        # result = pipeline.run_query_pipeline(
-        #     question=request.question,
-        #     db_url=request.db_connection.db_url
-        # )
+        # Get basic table info
+        table_names = schema_manager.get_table_names()
         
+        # Build lightweight table info for sidebar in the UI
+        tables_overview = []
+        for table_name in table_names:
+            pk_constraint = schema_manager.inspector.get_pk_constraint(table_name)
+            primary_keys = pk_constraint.get('constrained_columns', []) if pk_constraint else None
+            
+            tables_overview.append({
+                "name": table_name,
+                "primary_keys": primary_keys,  
+                "column_count": len(schema_manager.inspector.get_columns(table_name))
+            })
         
+        db_name = schema_manager.engine.url.database or "Unknown"
+        
+        return SchemaOverviewResponse(
+            database_name=db_name,
+            table_count=len(table_names),
+            tables=tables_overview
+        )
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.get("/schema/detailed", response_model=SchemaDetailedResponse,  tags=["2. Database Introspection"])
+def get_detailed_schema(connection_id: str):
+    """
+    Full detailed schema - for the detailed tab feature or LLM context.
+    Only called when user clicks detailed view or when LLM needs context.
+    """
+    if connection_id not in active_connections:
+        raise HTTPException(status_code=404, detail="Connection not found")
+    
+    schema_manager = active_connections[connection_id]
+    
+    try:
+        detailed_schema = schema_manager.get_detailed_schema()
+        return SchemaDetailedResponse(schema=detailed_schema)
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.post("/query", response_model=QueryDataResponse,  tags=["3. Chat Queries"])
+def process_nl_query(request: NLQueryRequest):
+    """
+    Chat queries - uses existing connection session.
+    """
+    if request.connection_id not in active_connections:
+        raise HTTPException(status_code=404, detail="Connection session expired")
+    
+    schema_manager = active_connections[request.connection_id]
+    
+    try:
+        print(f"Processing query: '{request.question}'")
+        
+        # Get schema context for LLM 
+        schema_context = schema_manager.get_detailed_schema()
+        
+        # The LLM pipeline will be implemented here
+        # result = pipeline.run_query_pipeline(request.question, schema_context)
+        
+        # mock data using real schema
         mock_result = {
             "original_question": request.question,
-            "generated_sql": "SELECT CustomerID, FirstName FROM Sales.Customers LIMIT 10; -- (mocked)",
-            "data": [
-                {"CustomerID": 1, "FirstName": "John"},
-                {"CustomerID": 2, "FirstName": "Jane"}
-            ]
+            "generated_sql": f"-- Using existing connection\nSELECT * FROM {schema_context['tables'][0]['name']} LIMIT 10;",
+            "data": [{"status": "Using persistent connection"}]
         }
         
         return QueryDataResponse(**mock_result)
-
+        
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"An error occurred in the pipeline: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.post("/disconnect", tags=["1. Database Connection"])
+def disconnect_database(connection_id: str):
+    """
+    Clean disconnect - disposes connection and removes from session.
+    Called when user logs out or switches databases.
+    """
+    if connection_id in active_connections:
+        active_connections[connection_id].dispose_engine()
+        del active_connections[connection_id]
+        return {"status": "disconnected"}
+    
+    return {"status": "connection not found"}
