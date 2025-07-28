@@ -31,50 +31,78 @@ class SchemaManager:
             raise ConnectionError(f"Database connection failed. Check URL/credentials. Error: {e}")
 
     def _get_table_row_count(self, schema_name: str, table_name: str) -> int:
-        """Helper to get row count for a table."""
+        """
+        Get row count with multiple fallback methods and better debugging.
+        """
         try:
             with self.engine.connect() as connection:
-                if 'mssql' in str(self.engine.url):
-                    query = text(f"""
-                    SELECT SUM(rows) as row_count
-                    FROM sys.partitions 
-                    WHERE object_id = OBJECT_ID('{schema_name}.{table_name}') 
-                    AND index_id IN (0,1)
-                    """)
-                else:
-                    query = text(f'SELECT COUNT(*) as row_count FROM "{schema_name}"."{table_name}"')
+                row_count = 0
                 
-                result = connection.execute(query)
-                row_count = result.fetchone()[0]
-                return int(row_count) if row_count else 0
-        except Exception:
-            return 0
+                if 'mssql' in str(self.engine.url):
+                    # Method 1: Try sys.partitions 
+                    try:
+                        query1 = text(f"""
+                        SELECT SUM(p.rows) as row_count
+                        FROM sys.tables t
+                        INNER JOIN sys.partitions p ON t.object_id = p.object_id
+                        INNER JOIN sys.schemas s ON t.schema_id = s.schema_id
+                        WHERE s.name = '{schema_name}' 
+                        AND t.name = '{table_name}'
+                        AND p.index_id IN (0,1)
+                        """)
+                        result = connection.execute(query1)
+                        row_count = result.fetchone()[0]
+                        if row_count and row_count > 0:
+                            print(f"Row count for {schema_name}.{table_name}: {row_count:,} (sys.partitions)")
+                            return int(row_count)
+                    except Exception as e:
+                        print(f"sys.partitions failed for {schema_name}.{table_name}: {e}")
+                    
+                    # Method 2: Try direct count (slower but accurate)
+                    try:
+                        query2 = text(f'SELECT COUNT(*) as row_count FROM [{schema_name}].[{table_name}]')
+                        result = connection.execute(query2)
+                        row_count = result.fetchone()[0]
+                        print(f"Row count for {schema_name}.{table_name}: {row_count:,} (direct count)")
+                        return int(row_count) if row_count else 0
+                    except Exception as e:
+                        print(f"Direct count failed for {schema_name}.{table_name}: {e}")
+        except Exception as e:
+            print(f"All row count methods failed for {schema_name}.{table_name}: {e}")
+        
+        return 0
     
     def get_schema_overview(self) -> Dict[str, Any]:
         """
-        Get overview showing only the TOP 2 SCHEMAS by total row count.
-        Each schema shows its top 3 most dense tables. (UI conception purpose)
+        Get overview showing the TOP 2 SCHEMAS by total row count.
+        Each schema shows its top 3 most dense tables.
         """
         try:
             schema_names = self.inspector.get_schema_names()
-            schema_summaries = []  # Will store schema info with total row counts
+            schema_summaries = []
+            
+            print(f"Found schemas: {schema_names}")
             
             # Step 1: For each schema, get top 3 tables and calculate total rows
             for schema_name in schema_names:
                 # Skip system schemas
                 if schema_name.lower() in ['information_schema', 'sys', 'guest']:
+                    print(f"Skipping system schema: {schema_name}")
                     continue
                     
                 table_names = self.inspector.get_table_names(schema=schema_name)
+                if not table_names:
+                    print(f"Schema '{schema_name}' has no tables, skipping")
+                    continue
+                    
                 schema_tables = []
-                
                 print(f"Processing schema '{schema_name}' with {len(table_names)} tables")
                 
                 # Get info for all tables in this schema
                 for table_name in table_names:
                     try:
                         pk_constraint = self.inspector.get_pk_constraint(table_name, schema=schema_name)
-                        primary_keys = pk_constraint.get('constrained_columns', []) if pk_constraint else None
+                        primary_keys = pk_constraint.get('constrained_columns', []) if pk_constraint else []
                         column_count = len(self.inspector.get_columns(table_name, schema=schema_name))
                         row_count = self._get_table_row_count(schema_name, table_name)
                         
@@ -105,18 +133,31 @@ class SchemaManager:
                 })
                 
                 print(f"Schema '{schema_name}': {len(top_3_tables)} tables, {total_rows:,} total rows")
+                for table in top_3_tables:
+                    print(f"  - {table['name']}: {table['row_count']:,} rows")
+            
+            if not schema_summaries:
+                print("No schemas with processable tables found!")
+                return {"tables": []}
             
             # Step 2: Sort schemas by total row count and take top 2
             schema_summaries.sort(key=lambda x: x['total_row_count'], reverse=True)
-            top_2_schemas = schema_summaries[:2]
             
-            # Step 3: Collect all tables from the top 2 schemas
+            print(f"Schema ranking by total row count:")
+            for i, schema in enumerate(schema_summaries):
+                print(f"  {i+1}. {schema['schema_name']}: {schema['total_row_count']:,} total rows")
+            
+            # Take top 2 schemas (or all if less than 2)
+            top_schemas = schema_summaries[:2]
+            print(f"Selected top {len(top_schemas)} schemas")
+            
+            # Step 3: Collect all tables from the selected schemas
             final_tables = []
-            for schema_summary in top_2_schemas:
+            for schema_summary in top_schemas:
                 final_tables.extend(schema_summary['top_tables'])
-                print(f"Selected schema '{schema_summary['schema_name']}' with {schema_summary['total_row_count']:,} total rows")
+                print(f"Added {len(schema_summary['top_tables'])} tables from schema '{schema_summary['schema_name']}'")
             
-            print(f"Overview: Returning {len(final_tables)} tables from {len(top_2_schemas)} schemas")
+            print(f"Overview: Returning {len(final_tables)} tables from {len(top_schemas)} schemas")
             return {"tables": final_tables}
             
         except SQLAlchemyError as e:
