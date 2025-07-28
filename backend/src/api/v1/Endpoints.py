@@ -49,7 +49,7 @@ def test_db_connection(request: DBConnectionRequest):
 def get_schema_overview(connection_id: str):
     """
     Lightweight schema for sidebar - just table names and primary keys.
-    Perfect for your sidebar display.
+    Called when user connects to the database and is in the chatting interface .
     """
     if connection_id not in active_connections:
         raise HTTPException(status_code=404, detail="Connection not found")
@@ -57,29 +57,15 @@ def get_schema_overview(connection_id: str):
     schema_manager = active_connections[connection_id]
     
     try:
-        # Get basic table info
-        table_names = schema_manager.get_table_names()
-        
-        # Build lightweight table info for sidebar in the UI
-        tables_overview = []
-        for table_name in table_names:
-            pk_constraint = schema_manager.inspector.get_pk_constraint(table_name)
-            primary_keys = pk_constraint.get('constrained_columns', []) if pk_constraint else None
-            
-            tables_overview.append({
-                "name": table_name,
-                "primary_keys": primary_keys,  
-                "column_count": len(schema_manager.inspector.get_columns(table_name))
-            })
-        
+        # Get overview: top 2 schemas with their top 3 tables each
+        overview_data = schema_manager.get_schema_overview()
         db_name = schema_manager.engine.url.database or "Unknown"
         
         return SchemaOverviewResponse(
             database_name=db_name,
-            table_count=len(table_names),
-            tables=tables_overview
+            table_count=len(overview_data["tables"]), 
+            tables=overview_data["tables"]
         )
-        
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
