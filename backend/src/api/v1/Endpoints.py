@@ -109,7 +109,7 @@ def process_nl_query(request: NLQueryRequest):
         # mock data using real schema
         mock_result = {
             "original_question": request.question,
-            "generated_sql": f"-- Using existing connection\nSELECT * FROM {schema_context['tables'][0]['name']} LIMIT 10;",
+            "generated_sql": f"SELECT * FROM {schema_context['tables'][0]['name']} LIMIT 10;",
             "data": [{"status": "Using persistent connection"}]
         }
         

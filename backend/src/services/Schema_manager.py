@@ -72,7 +72,7 @@ class SchemaManager:
                 for table_name in table_names:
                     try:
                         pk_constraint = self.inspector.get_pk_constraint(table_name, schema=schema_name)
-                        primary_keys = pk_constraint.get('constrained_columns', []) if pk_constraint else []
+                        primary_keys = pk_constraint.get('constrained_columns', []) if pk_constraint else None
                         column_count = len(self.inspector.get_columns(table_name, schema=schema_name))
                         row_count = self._get_table_row_count(schema_name, table_name)
                         
@@ -159,7 +159,7 @@ class SchemaManager:
 
                         # Get primary key
                         pk_constraint = self.inspector.get_pk_constraint(table_name, schema=schema_name)
-                        primary_key = pk_constraint.get('constrained_columns', []) if pk_constraint else []
+                        primary_key = pk_constraint.get('constrained_columns', []) if pk_constraint else None
 
                         # Get foreign keys
                         fks = self.inspector.get_foreign_keys(table_name, schema=schema_name)
