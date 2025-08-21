@@ -46,7 +46,7 @@ class SchemaOverviewResponse(BaseModel):
 
 class SchemaDetailedResponse(BaseModel):
     """Full schema for detailed view or LLM context."""
-    schema: Dict[str, Any]  # Full detailed schema
+    schema_detailed: Dict[str, Any]  # Full detailed schema
 
 class QueryDataResponse(BaseModel):
     """

@@ -1,6 +1,7 @@
 from fastapi import APIRouter, HTTPException, Body
 from ..models import DBConnectionRequest, NLQueryRequest, ConnectionTestResponse, QueryDataResponse, SchemaOverviewResponse, SchemaDetailedResponse
 from ...services.Schema_manager import SchemaManager
+from datetime import datetime
 import uuid
 
 # After we develop the AI-agents actual logic, the code here will continue like this:
@@ -82,7 +83,7 @@ def get_detailed_schema(connection_id: str):
     
     try:
         detailed_schema = schema_manager.get_detailed_schema()
-        return SchemaDetailedResponse(schema=detailed_schema)
+        return SchemaDetailedResponse(schema_detailed=detailed_schema)
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -117,6 +118,63 @@ def process_nl_query(request: NLQueryRequest):
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+@router.get("/schema/enhanced", tags=["2. Database Introspection"])
+def get_enhanced_schema(connection_id: str):
+    """
+    Get enhanced schema with RAG-ready context.
+    This endpoint provides the detailed schema enriched with:
+    - Business domain detection
+    - Relationship analysis
+    - Sample data
+    - Privacy-aware data masking
+    """
+    if connection_id not in active_connections:
+        raise HTTPException(status_code=404, detail="Connection not found")
+    
+    schema_manager = active_connections[connection_id]
+    
+    try:
+        enhanced_schema = schema_manager.get_enhanced_schema_for_rag()
+        return {
+            "enhanced_schema": enhanced_schema,
+            "analysis_timestamp": datetime.now().isoformat()
+        }
+        
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error getting enhanced schema: {str(e)}"
+        )
+
+@router.get("/schema/clustering", tags=["2. Database Introspection"])
+def get_clustering_tables(connection_id: str):
+    """
+    Get tables prepared for clustering analysis.
+    This endpoint provides tables formatted for:
+    - Semantic clustering
+    - Business domain grouping
+    - Relationship-based clustering
+    - Table similarity analysis
+    """
+    if connection_id not in active_connections:
+        raise HTTPException(status_code=404, detail="Connection not found")
+    
+    schema_manager = active_connections[connection_id]
+    
+    try:
+        clusterable_tables = schema_manager.get_tables_for_clustering()
+        return {
+            "tables": clusterable_tables,
+            "total_tables": len(clusterable_tables),
+            "analysis_timestamp": datetime.now().isoformat()
+        }
+        
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error preparing tables for clustering: {str(e)}"
+        )
 
 @router.post("/disconnect", tags=["1. Database Connection"])
 def disconnect_database(connection_id: str):

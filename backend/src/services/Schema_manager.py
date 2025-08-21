@@ -1,17 +1,35 @@
 from sqlalchemy import create_engine, inspect, text 
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import SQLAlchemyError
-from typing import Dict, List, Any, Optional, Set, Tuple
+from typing import Dict, List, Any, Set
 from datetime import datetime
 import re
 from collections import defaultdict
 from functools import lru_cache
-from collections import Counter
-import logging
 
-from nltk.stem import WordNetLemmatizer
-LEMMATIZER = WordNetLemmatizer()
-NLTK_AVAILABLE = True
+UNSUPPORTED_TYPE_NAMES = {
+    "geography",
+    "geometry",
+    "hierarchyid",
+    "sql_variant",
+    "xml"
+}
+
+# NLTK import handling
+try:
+    from nltk.stem import WordNetLemmatizer
+    LEMMATIZER = WordNetLemmatizer()
+    NLTK_AVAILABLE = True
+except ImportError:
+    LEMMATIZER = None
+    NLTK_AVAILABLE = False
+
+# Logging setup
+import logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+)
 
 class SchemaManager:
     """
@@ -25,7 +43,9 @@ class SchemaManager:
             self.engine = create_engine(db_url)
             self.inspector = inspect(self.engine)
             self.logger = logging.getLogger(__name__)
-    
+
+            self.raw_type_map = self._fetch_raw_column_types()
+            
             self.business_domains = self._load_business_domain_patterns()
             self.abbreviation_map = self._load_abbreviation_mappings()
             self.business_synonyms = self._load_business_synonyms()
@@ -39,22 +59,53 @@ class SchemaManager:
         """
         try:
             with self.engine.connect() as connection:
-                print(f"SUCCESS: Connection to {self.engine.url.host} verified.")
+                self.logger.info(f"SUCCESS: Connection to {self.engine.url.host} verified.")
                 return True
         except SQLAlchemyError as e:
-            print(f"ERROR: SQLAlchemy connection failed: {e}")
+            self.logger.error(f"SQLAlchemy connection failed: {e}")
             raise ConnectionError(f"Database connection failed. Check URL/credentials. Error: {e}")
+
+    def _fetch_raw_column_types(self) -> Dict[str, Dict[str, str]]:
+        """
+        Queries the database's information schema directly to get the ground-truth
+        data type for every column. This is our fallback for when SQLAlchemy's
+        inspector fails on unsupported types.
+        """
+        self.logger.info("Pre-fetching raw column data types from information_schema...")
+        type_map = {}
+        query = text("""
+            SELECT
+                TABLE_SCHEMA,
+                TABLE_NAME,
+                COLUMN_NAME,
+                DATA_TYPE
+            FROM
+                information_schema.columns
+        """)
+        try:
+            with self.engine.connect() as connection:
+                result = connection.execute(query)
+                for row in result:
+                    table_key = f"{row.TABLE_SCHEMA}.{row.TABLE_NAME}"
+                    if table_key not in type_map:
+                        type_map[table_key] = {}
+                    type_map[table_key][row.COLUMN_NAME] = row.DATA_TYPE
+            self.logger.info(f"Successfully cached raw types for {len(type_map)} tables.")
+            return type_map
+        except Exception as e:
+            self.logger.error(f"Could not fetch raw column types from information_schema: {e}")
+            return {} # Return an empty map on failure
 
     def _get_table_row_count(self, schema_name: str, table_name: str) -> int:
         """Simple row counting function"""
         try:
-           with self.engine.connect() as connection:
+            with self.engine.connect() as connection:
                 query = text(f'SELECT COUNT(*) FROM [{schema_name}].[{table_name}]')
                 result = connection.execute(query)
                 row_count = result.fetchone()[0]
                 return int(row_count) if row_count else 0
         except Exception as e:
-            print(f"Row count failed for {schema_name}.{table_name}: {e}")
+            self.logger.error(f"Row count failed for {schema_name}.{table_name}: {e}")
             return 0
     
     def get_schema_overview(self) -> Dict[str, Any]:
@@ -66,22 +117,22 @@ class SchemaManager:
             schema_names = self.inspector.get_schema_names()
             schema_summaries = []
             
-            print(f"Found schemas: {schema_names}")
+            self.logger.info(f"Found schemas: {schema_names}")
             
             # Step 1: For each schema, get top 3 tables and calculate total rows
             for schema_name in schema_names:
                 # Skip system schemas
                 if schema_name.lower() in ['information_schema', 'sys', 'guest']:
-                    print(f"Skipping system schema: {schema_name}")
+                    self.logger.info(f"Skipping system schema: {schema_name}")
                     continue
                     
                 table_names = self.inspector.get_table_names(schema=schema_name)
                 if not table_names:
-                    print(f"Schema '{schema_name}' has no tables, skipping")
+                    self.logger.info(f"Schema '{schema_name}' has no tables, skipping")
                     continue
                     
                 schema_tables = []
-                print(f"Processing schema '{schema_name}' with {len(table_names)} tables")
+                self.logger.info(f"Processing schema '{schema_name}' with {len(table_names)} tables")
                 
                 # Get info for all tables in this schema
                 for table_name in table_names:
@@ -101,7 +152,7 @@ class SchemaManager:
                         })
                         
                     except Exception as e:
-                        print(f"Warning: Could not process table '{schema_name}.{table_name}': {e}")
+                        self.logger.warning(f"Could not process table '{schema_name}.{table_name}': {e}")
                         continue
                 
                 # Sort tables by row count and take top 3
@@ -117,32 +168,32 @@ class SchemaManager:
                     "total_row_count": total_rows
                 })
                 
-                print(f"Schema '{schema_name}': {len(top_3_tables)} tables, {total_rows:,} total rows")
+                self.logger.info(f"Schema '{schema_name}': {len(top_3_tables)} tables, {total_rows:,} total rows")
                 for table in top_3_tables:
-                    print(f"  - {table['name']}: {table['row_count']:,} rows")
+                    self.logger.info(f"  - {table['name']}: {table['row_count']:,} rows")
             
             if not schema_summaries:
-                print("No schemas with processable tables found!")
+                self.logger.warning("No schemas with processable tables found!")
                 return {"tables": []}
             
             # Step 2: Sort schemas by total row count and take top 2
             schema_summaries.sort(key=lambda x: x['total_row_count'], reverse=True)
             
-            print(f"Schema ranking by total row count:")
+            self.logger.info(f"Schema ranking by total row count:")
             for i, schema in enumerate(schema_summaries):
-                print(f"  {i+1}. {schema['schema_name']}: {schema['total_row_count']:,} total rows")
+                self.logger.info(f"  {i+1}. {schema['schema_name']}: {schema['total_row_count']:,} total rows")
             
             # Take top 2 schemas (or all if less than 2)
             top_schemas = schema_summaries[:2]
-            print(f"Selected top {len(top_schemas)} schemas")
+            self.logger.info(f"Selected top {len(top_schemas)} schemas")
             
             # Step 3: Collect all tables from the selected schemas
             final_tables = []
             for schema_summary in top_schemas:
                 final_tables.extend(schema_summary['top_tables'])
-                print(f"Added {len(schema_summary['top_tables'])} tables from schema '{schema_summary['schema_name']}'")
+                self.logger.info(f"Added {len(schema_summary['top_tables'])} tables from schema '{schema_summary['schema_name']}'")
             
-            print(f"Overview: Returning {len(final_tables)} tables from {len(top_schemas)} schemas")
+            self.logger.info(f"Overview: Returning {len(final_tables)} tables from {len(top_schemas)} schemas")
             return {"tables": final_tables}
             
         except SQLAlchemyError as e:
@@ -163,14 +214,48 @@ class SchemaManager:
                     continue
                     
                 table_names = self.inspector.get_table_names(schema=schema_name)
-                print(f"Getting detailed info for schema '{schema_name}' with {len(table_names)} tables")
+                
+                if not table_names:
+                    self.logger.info(f"Schema '{schema_name}' has no tables, skipping for detailed view.")
+                    continue
+                
+                self.logger.info(f"Getting detailed info for schema '{schema_name}' with {len(table_names)} tables")
                 
                 for table_name in table_names:
                     try:
                         # Get full column details
                         columns = []
                         for col in self.inspector.get_columns(table_name, schema=schema_name):
-                            columns.append({"name": col['name'], "type": str(col['type'])})
+                    
+                            # Use the raw type map as a fallback ---
+                            sa_type_str = str(col['type'])
+                            definitive_type_name = sa_type_str
+
+                            if sa_type_str.lower() == 'null':
+                                table_key = f"{schema_name}.{table_name}"
+                                col_name = col['name']
+                                # Look up the real type from our pre-fetched map
+                                raw_name = self.raw_type_map.get(table_key, {}).get(col_name)
+                                if raw_name:
+                                    self.logger.debug(f"SQLAlchemy returned NULL for {table_key}.{col_name}. Using raw type: '{raw_name}'")
+                                    definitive_type_name = raw_name
+                                else:
+                                    self.logger.warning(f"Could not find raw type for {table_key}.{col_name}, treating as unsupported.")
+                                    definitive_type_name = "unknown" # rare
+                            
+                            # perform the check on the definitive, non-NULL type name
+                            is_supported = definitive_type_name.lower() not in UNSUPPORTED_TYPE_NAMES and definitive_type_name.lower() != "unknown"
+                            
+                            column_info = {
+                                "name": col['name'], 
+                                "type": definitive_type_name, # Store the most accurate type we found
+                                "supported": is_supported
+                            }
+                            
+                            if not is_supported:
+                                column_info["notes"] = f"Unsupported for direct query. Access value via the {col['name']}.ToString() method in SQL."
+                            
+                            columns.append(column_info)
 
                         # Get primary key
                         pk_constraint = self.inspector.get_pk_constraint(table_name, schema=schema_name)
@@ -197,10 +282,10 @@ class SchemaManager:
                         })
                         
                     except Exception as e:
-                        print(f"Warning: Could not process table '{schema_name}.{table_name}': {e}")
+                        self.logger.warning(f"Could not process table '{schema_name}.{table_name}': {e}")
                         continue
 
-            print(f"Detailed schema: Returning {len(all_tables)} tables from all schemas")
+            self.logger.info(f"Detailed schema: Returning {len(all_tables)} tables from all schemas")
             return {"tables": all_tables}
             
         except SQLAlchemyError as e:
@@ -210,7 +295,7 @@ class SchemaManager:
         " cleaning up the engine connection's pool"
         if self.engine:
             self.engine.dispose()
-            print("INFO: SQLAlchemy engine disposed.")
+            self.logger.info("SQLAlchemy engine disposed.")
     
     def get_enhanced_schema_for_rag(self) -> Dict[str, Any]:
         """
@@ -223,57 +308,51 @@ class SchemaManager:
             if not base_schema or not base_schema.get("tables"):
                 return base_schema
             
-            print(f"Enhancing schema with RAG-specific data for {len(base_schema['tables'])} tables")
+            self.logger.info(f"Enhancing schema with RAG-specific data for {len(base_schema['tables'])} tables")
             
             # Enhance each table with RAG-specific data
             enhanced_tables = []
             
             for table in base_schema["tables"]:
+                enhanced_table = table.copy()
                 try:
                     schema_name = table.get("schema", "")
                     table_name = table.get("table_name", "")
+                    columns_info = table.get("columns", "")
                     
-                    print(f"Processing table: {schema_name}.{table_name}")
+                    self.logger.info(f"Processing table: {schema_name}.{table_name}")
                     
                     # Add business context hints
-                    table["business_hints"] = self._extract_business_hints(table)
+                    enhanced_table["business_hints"] = self._extract_business_hints(table)
                     
                     # Add sample data for context
-                    table["sample_data"] = self._get_sample_data_safe(schema_name, table_name)
+                    enhanced_table["sample_data"] = self._get_sample_data_safe(schema_name, table_name, columns_info)
                     
                     # Add relationship analysis
                     analysis_result = self._analyze_table_relationships(table)
-                    relationships = analysis_result["relationships"]
-                    table["relationships_info"] = [
-                        dict(list(rel.items())[:4])  
-                        for rel in relationships
-                        ]
+                    enhanced_table["relationships_info"] = analysis_result["relationships"]
 
-                    # Add column analysis
-                    table["column_analysis"] = self._analyze_column_patterns(table)
-                    
                     # Add row count 
-                    table["row_count"] = self._get_table_row_count(schema_name, table_name)
+                    enhanced_table["row_count"] = self._get_table_row_count(schema_name, table_name)
                     
-                    enhanced_tables.append(table)
+                    enhanced_tables.append(enhanced_table)
                     
                 except Exception as e:
-                    print(f"Warning: Could not enhance table {schema_name}.{table_name}: {e}")
+                    self.logger.warning(f"Could not enhance table {schema_name}.{table_name}: {e}")
                     # Add the table without enhancements
                     enhanced_tables.append(table)
             
             # Create enhanced schema structure
             enhanced_schema = {
                 "tables": enhanced_tables,
-                "enhanced_at": datetime.now().isoformat(),
-                "enhancement_type": "rag_focused"
+                "enhanced_at": datetime.now().isoformat()
             }
             
-            print(f"Schema enhancement completed successfully")
+            self.logger.info(f"Schema enhancement completed successfully")
             return enhanced_schema
             
         except Exception as e:
-            print(f"Error enhancing schema for RAG: {str(e)}")
+            self.logger.error(f"Error enhancing schema for RAG: {str(e)}")
             # Return base schema as fallback
             return self.get_detailed_schema()
     
@@ -285,9 +364,7 @@ class SchemaManager:
                     "contact", "subscriber", "buyer", "consumer",
                     "client", "utilisateur", "compte", "membre", "personne", 
                     "contact", "abonne", "acheteur", "consommateur"
-                ],
-                "strength_weight": 1.0,
-                "clustering_priority": "high"
+                ]
             },
             "order_processing": {
                 "patterns": [
@@ -295,9 +372,7 @@ class SchemaManager:
                     "receipt", "payment", "checkout", "cart", "basket",
                     "commande", "achat", "transaction", "vente", "facture",
                     "recu", "paiement", "panier", "caisse"
-                ],
-                "strength_weight": 1.0,
-                "clustering_priority": "high"
+                ]
             },
             "inventory_management": {
                 "patterns": [
@@ -305,9 +380,7 @@ class SchemaManager:
                     "merchandise", "goods", "sku", "variant", "asset",
                     "produit", "article", "inventaire", "stock", "catalogue",
                     "marchandise", "bien", "variante", "actif"
-                ],
-                "strength_weight": 0.9,
-                "clustering_priority": "high"
+                ]
             },
             "financial_data": {
                 "patterns": [
@@ -315,9 +388,7 @@ class SchemaManager:
                     "revenue", "expense", "budget", "cost", "price",
                     "paiement", "facturation", "facture", "finance", "comptabilite",
                     "revenu", "depense", "budget", "cout", "prix"
-                ],
-                "strength_weight": 0.8,
-                "clustering_priority": "medium"
+                ]
             },
             "hr_management": {
                 "patterns": [
@@ -325,9 +396,7 @@ class SchemaManager:
                     "salary", "payroll", "benefit", "leave", "attendance",
                     "employe", "personnel", "departement", "role", "poste",
                     "salaire", "paie", "avantage", "conge", "presence"
-                ],
-                "strength_weight": 0.7,
-                "clustering_priority": "medium"
+                ]
             },
             "logistics": {
                 "patterns": [
@@ -335,9 +404,7 @@ class SchemaManager:
                     "transport", "freight", "shipment", "location", "address",
                     "livraison", "entrepot", "fournisseur", "vendeur",
                     "transport", "fret", "expedition", "localisation", "adresse"
-                ],
-                "strength_weight": 0.8,
-                "clustering_priority": "medium"
+                ]
             },
             "content_management": {
                 "patterns": [
@@ -345,9 +412,7 @@ class SchemaManager:
                     "page", "post", "comment", "message", "notification",
                     "contenu", "article", "document", "media", "fichier",
                     "page", "publication", "commentaire", "message", "notification"
-                ],
-                "strength_weight": 0.6,
-                "clustering_priority": "low"
+                ]
             },
             "audit_tracking": {
                 "patterns": [
@@ -355,9 +420,7 @@ class SchemaManager:
                     "activity", "session", "trace", "monitor",
                     "journal", "audit", "historique", "suivi", "evenement",
                     "activite", "session", "trace", "surveillance"
-                ],
-                "strength_weight": 0.3,
-                "clustering_priority": "low"
+                ]
             }
         }
     
@@ -512,70 +575,24 @@ class SchemaManager:
         
         return frozenset(enhanced_tokens)
 
-    def advanced_pattern_matching(self, text: str, patterns: List[str], 
-                                threshold: float = 0.3) -> Tuple[bool, float, List[str]]:
-        """
-        Advanced pattern matching with confidence scoring, business patterns comparison against the augmented text
-        Returns: (matches, confidence_score, matched_patterns)
-        """
-        if not text or not patterns:
-            return False, 0.0, []
-        
-        text_tokens = self.get_enhanced_tokens(text)
-        matched_patterns = []
-        total_score = 0.0
-        
-        for pattern in patterns:
-            pattern_tokens = self.get_enhanced_tokens(pattern)
-            
-            if not pattern_tokens:
-                continue
-            
-            intersection = text_tokens.intersection(pattern_tokens)
-            if intersection:
-                pattern_score = len(intersection) / len(pattern_tokens)
-                total_score += pattern_score
-                matched_patterns.append({
-                    'pattern': pattern,
-                    'score': pattern_score,
-                    'matched_tokens': list(intersection)
-                })
-        
-        if matched_patterns:
-            confidence = total_score / len(patterns)
-            matches = confidence >= threshold
-            return matches, confidence, matched_patterns
-        
-        return False, 0.0, []
-
     def _extract_business_hints(self, table_info: Dict[str, Any]) -> List[str]:
         """Enhanced business intelligence extraction with confidence scoring."""
         table_name = table_info.get("table_name", "")
         columns = table_info.get("columns", [])
-        foreign_keys = table_info.get("foreign_keys", [])
-        
         hints = []
-        domain_analysis = {}
+
+        table_tokens = self.get_enhanced_tokens(table_name)
+        all_columns_tokens=set()
+        for col in columns :
+            all_columns_tokens.update(self.get_enhanced_tokens(col["name"]))
         
         # Advanced domain classification
-        for domain_name, domain_config in self.business_domains.items():
-            patterns = domain_config["patterns"] 
+        for domain_name, patterns in self.business_domains.items(): 
+            domain_tokens = set()
+            for pattern in patterns :
+                domain_tokens.update(self.get_enhanced_tokens(pattern))
             
-            # Check table name
-            table_matches, table_confidence, _ = self.advanced_pattern_matching(
-                table_name, patterns, threshold=0.2
-            )
-            
-            # Check column names
-            column_text = " ".join([col["name"] for col in columns])
-            column_matches, column_confidence, _ = self.advanced_pattern_matching(
-                column_text, patterns, threshold=0.1
-            )
-            
-            # Combined scoring
-            combined_confidence = (table_confidence * 0.7 + column_confidence * 0.3) * domain_config["strength_weight"]
-            
-            if combined_confidence > 0.3:
+            if domain_tokens.intersection(table_tokens) or domain_tokens.intersection(all_columns_tokens) :
                 hints.append(domain_name)
         
         # Add specialized pattern detection
@@ -657,75 +674,97 @@ class SchemaManager:
         
         
         return patterns        
-    
-    def _get_sample_data_safe(self, schema_name: str, table_name: str, max_rows: int = 5) -> List[Dict[str, Any]]:
+
+    def _get_sample_data_safe(self, schema_name: str, table_name: str, columns_info: List[Dict[str, Any]], max_rows: int = 5) -> List[Dict[str, Any]]:
         """
-        Get representative sample data with privacy protection.
-        Enhanced version of your existing row counting approach.
+        Fetches sample data, proactively converting unsupported data types (like GEOGRAPHY)
+        to a readable string format at the database level. This ensures all columns are
+        represented in the sample data without causing driver errors.
+        
+        Args:
+            schema_name: The name of the database schema.
+            table_name: The name of the table.
+            columns_info: A list of column dictionaries, each annotated with a
+                        'supported': True/False flag.
+            max_rows: The maximum number of sample rows to return.
+            
+        Returns:
+            A list of dictionaries representing sample rows, with special types as strings.
         """
+        full_table_name = f"[{schema_name}].[{table_name}]"
+        self.logger.info(f"==> Fetching sample data for: {full_table_name}")
+
+        # --- Step 1: Dynamically build the SELECT clause ---
+        select_expressions = []
+        for col in columns_info:
+            col_name = col["name"]
+            # The AS clause is crucial to ensure the column name in the result set is clean
+            if col.get("supported", True):
+                select_expressions.append(f"[{col_name}]")
+            else:
+                # Proactively convert the unsupported type to a string representation.
+                expression = f"[{col_name}].ToString() AS [{col_name}]"
+                select_expressions.append(expression)
+                self.logger.info(f"  Applying .ToString() conversion for unsupported column: [{col_name}]")
+
+        if not select_expressions:
+            self.logger.warning(f"  No columns to select for {full_table_name}. Cannot fetch sample data.")
+            return []
+        
+        column_list_str = ', '.join(select_expressions)
+
         try:
             with self.engine.connect() as connection:
-                # Build sample query with TABLESAMPLE for better sampling on large tables
-                # Note: TABLESAMPLE works on SQL Server, for other DBs would need different approach
                 
-                # First check if table has data
-                count_query = text(f'SELECT COUNT(*) FROM [{schema_name}].[{table_name}]')
-                count_result = connection.execute(count_query)
-                row_count = count_result.fetchone()[0]
-                
-                if row_count == 0:
+                # --- Step 2: Execute initial query to determine table size ---
+                try:
+                    initial_query_str = f'SELECT TOP 101 {column_list_str} FROM {full_table_name}'
+                    self.logger.info(f"  Executing initial check query with conversions.")
+                    
+                    result_proxy = connection.execute(text(initial_query_str))
+                    columns = list(result_proxy.keys())
+                    rows = result_proxy.fetchall()
+                    self.logger.info(f"  Initial check query returned {len(rows)} rows.")
+
+                except Exception as query_error:
+                    self.logger.error(f"  Query execution failed for {full_table_name} despite conversions: {query_error}", exc_info=True)
+                    return []
+
+                if not rows:
                     return []
                 
-                # Choose sampling strategy based on table size
-                if row_count <= 100:
-                    # Small table - just get top rows
-                    sample_query = text(f'SELECT TOP {max_rows} * FROM [{schema_name}].[{table_name}]')
-                else:
-                    # Large table - try to get more representative sample
-                    # Use TABLESAMPLE for better distribution (SQL Server specific)
+                # --- Step 3: Determine and execute final sampling strategy ---
+                final_rows = []
+                if len(rows) > 100:
+                    self.logger.info(f"    Large table detected. Using random sampling.")
                     try:
-                        sample_query = text(f'''
-                            SELECT TOP {max_rows} * 
-                            FROM [{schema_name}].[{table_name}] TABLESAMPLE (500 ROWS)
-                        ''')
-                    except:
-                        # Fallback to simple TOP if TABLESAMPLE fails
-                        sample_query = text(f'SELECT TOP {max_rows} * FROM [{schema_name}].[{table_name}]')
-                
-                result = connection.execute(sample_query)
-                
-                # Get column names
-                columns = [desc.name for desc in result.description]
-                
-                # Fetch sample rows
-                rows = result.fetchall()
-                
-                # Convert to list of dictionaries with privacy protection
+                        sample_query_str = f'SELECT TOP {max_rows} {column_list_str} FROM {full_table_name} ORDER BY NEWID()'
+                        sample_result = connection.execute(text(sample_query_str))
+                        final_rows = sample_result.fetchall()
+                    except Exception as sample_error:
+                        self.logger.error(f"    Random sampling failed for {full_table_name}: {sample_error}")
+                        final_rows = rows[:max_rows]
+                else:
+                    self.logger.info(f"    Small table detected. Using the initially fetched rows.")
+                    final_rows = rows[:max_rows]
+
+                # --- Step 4: Convert rows to dictionaries with privacy protection ---
                 sample_data = []
-                for row in rows:
-                    row_dict = {}
-                    for i, value in enumerate(row):
-                        column_name = columns[i].lower()
-                        
-                        # Privacy protection - mask sensitive columns
-                        if self._is_sensitive_column(column_name):
-                            row_dict[columns[i]] = "[SENSITIVE_DATA]"
+                for row in final_rows:
+                    row_dict = dict(zip(columns, row))
+                    for col_name, value in row_dict.items():
+                        if self._is_sensitive_column(col_name.lower()):
+                            row_dict[col_name] = "[SENSITIVE_DATA]"
                         elif value is not None:
-                            # Truncate long values
                             str_value = str(value)
-                            if len(str_value) > 50:
-                                row_dict[columns[i]] = str_value[:50] + "..."
-                            else:
-                                row_dict[columns[i]] = str_value
-                        else:
-                            row_dict[columns[i]] = None
-                    
+                            row_dict[col_name] = str_value[:50] + "..." if len(str_value) > 50 else str_value
                     sample_data.append(row_dict)
                 
+                self.logger.info(f"    Successfully processed and returning {len(sample_data)} sample rows from {full_table_name}.")
                 return sample_data
                 
         except Exception as e:
-            print(f"Could not get sample data for {schema_name}.{table_name}: {e}")
+            self.logger.error(f"!!! UNEXPECTED ERROR in _get_sample_data_safe for {full_table_name}: {e}", exc_info=True)
             return []
     
     def _is_sensitive_column(self, column_name: str) -> bool:# Done!
@@ -806,53 +845,33 @@ class SchemaManager:
                 
                 # Initialize relationship classification
                 relationship_type = "general_reference"
-                strength_score = 0.5
-                clustering_weight = "medium"
                 
                 # Enhanced pattern matching using token intersection
                 if col_tokens.intersection(business_tokens):
                     relationship_type = "core_business"
-                    strength_score = 1.0
-                    clustering_weight = "high"
                 
                 elif col_tokens.intersection(audit_tokens):
                     relationship_type = "audit"
-                    strength_score = 0.2
-                    clustering_weight = "low"
                 
                 elif col_tokens.intersection(lookup_tokens):
                     relationship_type = "lookup"
-                    strength_score = 0.4
-                    clustering_weight = "medium"
                 
                 elif col_tokens.intersection(hierarchical_tokens):
                     relationship_type = "hierarchical"
-                    strength_score = 0.7
-                    clustering_weight = "medium"
                 
                 # Enhanced ID pattern analysis
                 elif col_tokens.intersection({"id", "identifier", "key"}):
                     if referred_table_tokens.intersection(business_tokens):
                         relationship_type = "core_business"
-                        strength_score = 0.9
-                        clustering_weight = "high"
                     elif referred_table_tokens.intersection(lookup_tokens):
                         relationship_type = "lookup"
-                        strength_score = 0.4
-                        clustering_weight = "medium"
                     elif referred_table_tokens.intersection(audit_tokens):
                         relationship_type = "audit"
-                        strength_score = 0.3
-                        clustering_weight = "low"
                     else:
                         relationship_type = "lookup_reference"
-                        strength_score = 0.5
-                        clustering_weight = "medium"
                 
                 elif col_tokens.intersection({"key", "business", "external", "reference"}):
                     relationship_type = "business_key"
-                    strength_score = 0.8
-                    clustering_weight = "high"
                 
                 # Create relationship record
                 relationship = {
@@ -860,164 +879,53 @@ class SchemaManager:
                     "target_schema": referred_schema,
                     "via_column": column_name,
                     "relationship_type": relationship_type,
-                    "strength_score": strength_score,
-                    "clustering_weight": clustering_weight,
-                    "full_target_id": f"{referred_schema}.{referred_table}",
                     "is_cross_schema": referred_schema != table_info.get("schema", "")
                 }
                 
                 relationships.append(relationship)
         
-        # Calculate summary statistics (same as your original)
-        total_relationships = len(relationships)
-        high_strength_rels = [rel for rel in relationships if rel["clustering_weight"] == "high"]
-        strongest_targets = list(set([rel["full_target_id"] for rel in high_strength_rels]))
-        
-        referenced_schemas = set(rel["target_schema"] for rel in relationships)
-        cross_schema_rels = [rel for rel in relationships if rel["is_cross_schema"]]
-        has_cross_schema = len(cross_schema_rels) > 0
-        
         return {
-            "relationships": relationships,
-            "summary": {
-                "total_relationships": total_relationships,
-                "cross_schema_relationships": has_cross_schema,
-                "referenced_schemas": list(referenced_schemas)
-            },
-            "clustering_guidance": {
-                "strongest_targets": strongest_targets,
-                "avoid_clustering_with": [rel["full_target_id"] for rel in relationships if rel["clustering_weight"] == "low"]
-            }
+            "relationships": relationships
         }
     
-    def _analyze_column_patterns(self, table_info: Dict[str, Any]) -> Dict[str, Any]:
-        """Analyze column patterns for better business understanding."""
-        columns = table_info.get("columns", [])
-        primary_key = table_info.get("primary_key", [])
-        
-        # Initialize analysis categories
-        identity_columns = []
-        descriptive_columns = []
-        temporal_columns = []
-        financial_columns = []
-        status_columns = []
-        sensitive_columns = []
-        
-        # Analyze each column (bilingual patterns)
-        for col in columns:
-            col_name = col.get("name", "").lower()
-            col_type = col.get("type", "").lower()
 
-             # Check if column is sensitive (for RAG awareness)
-            if self._is_sensitive_column(col_name):
-                sensitive_columns.append(col["name"])
-            
-            # Classify by naming patterns
-            if col_name in [pk.lower() for pk in primary_key] or "id" in col_name:
-                identity_columns.append(col["name"])
-            
-            # Descriptive columns (bilingual)
-            if any(pattern in col_name for pattern in ["name", "title", "description", "label", "nom", "titre", "libelle"]):
-                descriptive_columns.append(col["name"])
-            
-            # Temporal columns (bilingual)
-            if any(pattern in col_name for pattern in ["date", "time", "created", "updated", "modified", "cree", "modifie", "heure"]) or \
-               any(pattern in col_type for pattern in ["date", "time", "timestamp"]):
-                temporal_columns.append(col["name"])
-            
-            # Financial columns (bilingual)
-            if any(pattern in col_name for pattern in ["amount", "price", "cost", "total", "fee", "salary", "montant", "prix", "cout", "frais", "salaire"]) or \
-               any(pattern in col_type for pattern in ["money", "decimal", "numeric"]):
-                financial_columns.append(col["name"])
-            
-            # Status columns (bilingual)
-            if any(pattern in col_name for pattern in ["status", "state", "active", "enabled", "flag", "statut", "etat", "actif"]):
-                status_columns.append(col["name"])
-        
-        # Calculate column statistics
-        total_columns = len(columns)
-        
-        return {
-            "total_columns": total_columns,
-            "identity_columns": identity_columns,
-            "descriptive_columns": descriptive_columns,
-            "temporal_columns": temporal_columns,
-            "financial_columns": financial_columns,
-            "status_columns": status_columns,
-            "sensitive_columns": sensitive_columns
-        }
-    
-    def _calculate_clustering_metadata(self, enhanced_tables: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """Calculate overall schema statistics for RAG optimization."""
-        if not enhanced_tables:
-            return {}
-        
-        # Gather statistics
-        total_tables = len(enhanced_tables)
-        total_relationships = sum(len(table.get("foreign_keys", [])) for table in enhanced_tables)
-        
-        # Business domain analysis
-        all_business_hints = []
-        tables_with_relationships = 0
-        
-        for table in enhanced_tables:
-            all_business_hints.extend(table.get("business_hints", []))
-            if len(table.get("foreign_keys", [])) > 0:
-              tables_with_relationships += 1
-        
-        # Count unique business domains
-        unique_domains = list(set(all_business_hints))
-        
-        # Calculate clustering potential
-        relationship_ratio = tables_with_relationships / total_tables if total_tables > 0 else 0
-        avg_relationships_per_table = total_relationships / total_tables if total_tables > 0 else 0
-        
-        if relationship_ratio > 0.7 and avg_relationships_per_table > 1.0:
-            clustering_potential = "high"
-        elif relationship_ratio > 0.4 and avg_relationships_per_table > 0.5:
-            clustering_potential = "medium"
-        else:
-            clustering_potential = "low"
-        
-        return {
-            "total_tables": total_tables,
-            "total_relationships": total_relationships,
-            "tables_with_relationships": tables_with_relationships,
-            "business_domains_detected": unique_domains,
-            "clustering_potential": clustering_potential
-        }
-    
     def get_tables_for_clustering(self) -> List[Dict[str, Any]]:
-        """Get enhanced table information formatted for clustering analysis."""
+        """
+        Extracts only the essential information from the schema needed for
+        graph-based clustering: table IDs and their foreign key relationships.
+        """
         try:
-            enhanced_schema = self.get_enhanced_schema_for_rag()
+            base_schema = self.get_detailed_schema()
             
-            if not enhanced_schema or not enhanced_schema.get("tables"):
-                print("No enhanced schema data available for clustering")
+            if not base_schema or not base_schema.get("tables"):
+                self.logger.warning("No schema data available for clustering")
                 return []
             
-            # Transform enhanced tables into clustering format
-            clustering_tables = []
+            clustering_data = []
             
-            for table in enhanced_schema["tables"]:
-                full_relationship_metrics = self._analyze_table_relationships(table)
-                clustering_table = {
-                    "schema_name": table.get("schema", ""),
+            for table in base_schema["tables"]:
+                schema_name = table.get("schema", "")
+                foreign_keys = table.get("foreign_keys", [])
+                
+                # Add cross-schema flag to each FK
+                enhanced_fks = []
+                for fk in foreign_keys:
+                    fk_copy = fk.copy()
+                    fk_copy["is_cross_schema"] = (
+                        fk.get("referred_schema", schema_name) != schema_name
+                    )
+                    enhanced_fks.append(fk_copy)
+                
+                clustering_data.append({
+                    "schema_name": schema_name,
                     "table_name": table.get("table_name", ""),
-                    "full_table_id": f"{table.get('schema', '')}.{table.get('table_name', '')}",
-                    "columns": table.get("columns", []),
-                    "foreign_keys": table.get("foreign_keys", []),
-                    "primary_key": table.get("primary_key", []),
-                    "business_hints": table.get("business_hints", []),
-                    "column_analysis": table.get("column_analysis", {}),
-                    "sample_data": table.get("sample_data", []),
-                    "relationship_info": full_relationship_metrics
-                }
-                clustering_tables.append(clustering_table)
+                    "full_table_id": f"{schema_name}.{table.get('table_name', '')}",
+                    "foreign_keys": enhanced_fks,
+                })
             
-            print(f"Prepared {len(clustering_tables)} tables for clustering analysis")
-            return clustering_tables
+            self.logger.info(f"Prepared {len(clustering_data)} tables with essential data for clustering.")
+            return clustering_data
             
         except Exception as e:
-            print(f"Error preparing tables for clustering: {str(e)}")
+            self.logger.error(f"Error preparing tables for clustering: {str(e)}")
             return []
