@@ -7,194 +7,250 @@ as an optimization step in Natural Language to SQL (NL2SQL) applications to redu
 the number of LLM calls when generating descriptive metadata.
 """
 
+import hashlib
 import logging
-from typing import Any, Dict, List, Set, Optional
+import itertools
+from difflib import SequenceMatcher
+import re
+import os
+from typing import Any, Dict, List, Optional
 import networkx as nx
+from networkx.algorithms import community
 
-# Get a logger instance for this module. The configuration will be handled
-# by the main application entry point (e.g., main.py).
 logger = logging.getLogger(__name__)
+
+# A similarity function for column names
+def text_similarity(s1: str, s2: str, weights: dict = None) -> float:
+    """
+    Calculate text similarity using a weighted combination of multiple techniques:
+    1. Word-level similarity (Jaccard index on token sets)
+    2. Character sequence similarity (SequenceMatcher ratio)
+    3. Common prefix length
+    4. Acronym similarity
+    
+    Args:
+        s1 (str): The first string to compare.
+        s2 (str): The second string to compare.
+        weights (dict, optional): A dictionary to override the default weights.
+                                  Defaults to {'word': 0.4, 'char': 0.3, 
+                                  'prefix': 0.2, 'acronym': 0.1}.
+
+    Returns:
+        float: A composite similarity score between 0 and 1.
+    """
+    # --- Default weights can be overridden for testing ---
+    if weights is None:
+        weights = {
+            'word': 0.4,
+            'char': 0.3,
+            'prefix': 0.2,
+            'acronym': 0.1
+        }
+
+    def tokenize(s: str) -> list:
+        # Split on common delimiters and camelCase
+        s = re.sub(r'([a-z])([A-Z])', r'\1 \2', s)
+        return re.split(r'[_\s-]+', s.lower())
+    
+    def get_acronym(tokens: list) -> str:
+        return ''.join(word[0] for word in tokens if word)
+    
+    # Pre-tokenize for efficiency
+    tokens1 = tokenize(s1)
+    tokens2 = tokenize(s2)
+
+    # 1. Word-level similarity (Jaccard Index = A(intersection)B/AUB)
+    words1 = set(tokens1)
+    words2 = set(tokens2)
+    word_sim = len(words1.intersection(words2)) / max(len(words1.union(words2)), 1)
+    
+    # 2. Character sequence similarity
+    s1_lower, s2_lower = s1.lower(), s2.lower()
+    char_sim = SequenceMatcher(None, s1_lower, s2_lower).ratio()
+    
+    # 3. Prefix/Suffix similarity
+    prefix_len = len(os.path.commonprefix([s1_lower, s2_lower]))
+    # Normalize by the length of the longer string
+    prefix_sim = prefix_len / max(len(s1), len(s2), 1)
+    
+    # 4. Acronym similarity
+    acr1 = get_acronym(tokens1)
+    acr2 = get_acronym(tokens2)
+    acronym_sim = SequenceMatcher(None, acr1, acr2).ratio() if acr1 and acr2 else 0.0
+    
+    # Weighted combination
+    final_score = (
+        weights['word'] * word_sim +
+        weights['char'] * char_sim +
+        weights['prefix'] * prefix_sim +
+        weights['acronym'] * acronym_sim
+    )
+    
+    return final_score
 
 class ClusteringService:
     """
-    A service for clustering database tables based on foreign key relationships.
-    
-    This class models database schemas as undirected graphs where:
-    - Each table is a node (identified by full_table_id)
-    - Each foreign key relationship is an edge
-    - Clusters are the connected components of the graph
-    
-    Attributes:
-        _tables_data: List of table dictionaries containing schema information.
-        _graph: NetworkX undirected graph representing table relationships.
-        _clusters: A cached list of the computed clusters to avoid re-computation.
+    An advanced service for clustering database tables using a weighted graph model.
+    It supports automatic refinement of large clusters via community detection and
+    automated tuning of algorithm parameters using quality metrics.
     """
-    
     def __init__(self, tables_data: List[Dict[str, Any]]) -> None:
-        """
-        Initialize the ClusteringService with table data.
-        
-        Args:
-            tables_data: List of dictionaries, each representing a table with:
-                - schema_name: Schema name (str)
-                - table_name: Table name (str) 
-                - full_table_id: Full table identifier (str)
-                - foreign_keys: List of foreign key relationships (List[Dict])
-                
-        Raises:
-            ValueError: If tables_data is empty or None.
-            TypeError: If tables_data is not a list.
-        """
-        if not isinstance(tables_data, list):
-            raise TypeError("tables_data must be a list")
-        
-        if not tables_data:
-            raise ValueError("tables_data cannot be empty")
+        if not isinstance(tables_data, list) or not tables_data:
+            raise ValueError("tables_data must be a non-empty list")
         
         self._tables_data = tables_data
+        self._table_map = {t['full_table_id']: t for t in tables_data}
+        self._graph: Optional[nx.Graph] = None
+        self._cache={}
+
+        sorted_table_ids = sorted([t['full_table_id'] for t in tables_data])
+        schema_string = ",".join(sorted_table_ids)
+        self._schema_fingerprint = hashlib.md5(schema_string.encode()).hexdigest()
+        
+        logger.info(f"Initialized ClusteringService for schema with fingerprint: {self._schema_fingerprint}")
+    
+    def _build_weighted_graph(self) -> None:
+        """
+        Builds a weighted, undirected graph from table relationships.
+        The edge weight represents the "strength" of the relationship.
+        """
+        if self._graph is not None:
+            return
+
+        logger.info("Building weighted relationship graph...")
         self._graph = nx.Graph()
         
-        # Initialize cache for lazy loading ---
-        self._clusters: Optional[List[List[str]]] = None
-        
-        logger.info(f"Initialized ClusteringService with {len(tables_data)} tables")
-    
-    def _build_relationship_graph(self) -> None:
-        """
-        Build an undirected graph from table foreign key relationships.
-        
-        This method is idempotent and safe to call multiple times, but will
-        only build the graph if it hasn't been built already.
-        """
-        if self._graph.number_of_nodes() > 0:
-            return  # Graph already built
+        for table in self._tables_data:
+            self._graph.add_node(table['full_table_id'])
 
-        logger.info("Building relationship graph...")
-        
-        # First pass: Add all tables as nodes
-        table_ids: Set[str] = set()
-        for table in self._tables_data:
-            full_table_id = table.get("full_table_id")
-            if full_table_id:
-                self._graph.add_node(full_table_id)
-                table_ids.add(full_table_id)
-        
-        logger.debug(f"Added {len(table_ids)} table nodes to graph")
-        
-        # Second pass: Add edges for foreign key relationships
-        edges_added = 0
-        for table in self._tables_data:
-            source_table_id = table.get("full_table_id")
-            if not source_table_id:
-                continue
+        for source_table in self._tables_data:
+            source_id = source_table['full_table_id']
+            for fk in source_table.get('foreign_keys', []):
+                target_schema = fk.get('referred_schema', source_table.get('schema_name'))
+                target_name = fk.get('referred_table')
+                if not target_name: continue
                 
-            foreign_keys = table.get("foreign_keys", [])
-            for fk in foreign_keys:
-                referred_schema = fk.get("referred_schema", "")
-                referred_table = fk.get("referred_table", "")
+                target_id = f"{target_schema}.{target_name}"
+                target_table = self._table_map.get(target_id)
+                if not target_table: continue
+
+                # --- Edge Weight Calculation ---
+                weight = 1.0
                 
-                if referred_schema and referred_table:
-                    referred_table_id = f"{referred_schema}.{referred_table}"
-                    
-                    if referred_table_id not in table_ids:
-                        self._graph.add_node(referred_table_id)
-                        logger.debug(f"Added referenced table node: {referred_table_id}")
-                    
-                    self._graph.add_edge(source_table_id, referred_table_id)
-                    edges_added += 1
-                    logger.debug(f"Added edge: {source_table_id} <-> {referred_table_id}")
-        
-        logger.info(f"Graph construction complete. Nodes: {self._graph.number_of_nodes()}, "
-                    f"Edges: {edges_added}")
-    
-    def cluster_tables(self) -> List[List[str]]:
+                # 1. Semantic Strength (Business Hints)
+                source_hints = set(source_table.get('business_hints', []))
+                target_hints = set(target_table.get('business_hints', []))
+                if source_hints.intersection(target_hints):
+                    weight += 0.5
+                
+                # 2. Naming Convention Strength
+                fk_col = fk['constrained_columns'][0]
+                pk_col = (target_table.get('primary_key') or ['id'])[0]
+                weight += 0.3 * text_similarity(fk_col, pk_col)
+                
+                # 3. Cross-Schema Penalty
+                if source_table.get('schema_name') != target_schema:
+                    weight -= 0.4
+                
+                self._graph.add_edge(source_id, target_id, weight=max(0.1, weight)) # Ensure weight is positive
+
+        logger.info(f"Weighted graph built. Nodes: {self._graph.number_of_nodes()}, Edges: {self._graph.number_of_edges()}")
+
+    def find_best_community_partition(self, component: set) -> List[List[str]]:
         """
-        Cluster tables based on their foreign key relationships.
+        Tests multiple resolution values for the Louvain algorithm and selects
+        the partition with the highest modularity score.
+        """
+        subgraph = self._graph.subgraph(component)
+        best_partition = None
+        best_modularity = -1
         
-        This method builds the relationship graph and finds connected components,
-        where each component represents a cluster of related tables. The result
-        is cached after the first computation.
+        # Test a range of resolution values to find the best one
+        resolutions_to_test = [0.8, 1.0, 1.2, 1.5]
+        logger.info(f"  -> Finding best partition for component of size {len(component)}...")
+        
+        for res in resolutions_to_test:
+            partition = community.louvain_communities(subgraph, resolution=res, weight='weight')
+            modularity = community.modularity(subgraph, partition, weight='weight')
+            logger.debug(f"  - Resolution {res}: Modularity={modularity:.4f}, Communities={len(partition)}")
+            
+            if modularity > best_modularity:
+                best_modularity = modularity
+                best_partition = partition
+        
+        logger.info(f"  -> Best partition found with modularity {best_modularity:.4f}, resulting in {len(best_partition)} communities.")
+        return [sorted(list(p)) for p in best_partition]
+
+    def cluster_tables(self, refinement_threshold: int = 10) -> List[Dict[str, Any]]:
+        """
+        Clusters tables and generates rich metadata for each cluster.
+        Automatically refines large clusters using quality-tuned community detection.
+        
+        Args:
+            refinement_threshold: The size above which a cluster is considered "large".
         
         Returns:
-            List[List[str]]: List of clusters, where each cluster is a sorted list of 
-            full_table_id strings. The clusters are sorted by size (descending).
+            A list of dictionaries, where each dict represents a cluster and its metadata.
         """
-        if self._clusters is not None:
-            return self._clusters
+        cache_key = f"{self._schema_fingerprint}_thresh_{refinement_threshold}"
+        if cache_key in self._cache:
+            return self._cache[cache_key]
 
-        logger.info("Starting table clustering process...")
-        self._build_relationship_graph()
+        self._build_weighted_graph()
         
-        connected_components = list(nx.connected_components(self._graph))
+        final_groups_metadata = []
+        components = list(nx.connected_components(self._graph))
         
-        clusters = []
-        for component in connected_components:
-            cluster = sorted(list(component))
-            clusters.append(cluster)
-            logger.debug(f"Found cluster with {len(cluster)} tables: {cluster}")
+        for i, component in enumerate(components):
+            parent_id = str(i+1)
+            component_subgraph = self._graph.subgraph(component)
+            
+            if len(component) > refinement_threshold:
+                # Refine this large component
+                refined_communities = self.find_best_community_partition(component)
+                for j, comm in enumerate(refined_communities):
+                    comm_subgraph = self._graph.subgraph(comm)
+                    cluster_id = f"{parent_id}-{j+1}"
+                    metadata = self._get_rich_cluster_metadata(subgraph=comm_subgraph, cluster_id=cluster_id, parent_component_id=parent_id, is_refined=True)
+                    final_groups_metadata.append(metadata)
+            else:
+                # Keep this small component as a single cluster
+                metadata = self._get_rich_cluster_metadata(subgraph=component_subgraph, cluster_id=parent_id, parent_component_id=parent_id, is_refined=False)
+                final_groups_metadata.append(metadata)
+
+        final_groups_metadata.sort(key=lambda x: x['size'], reverse=True)
+        self._cache[cache_key] = final_groups_metadata
+        return final_groups_metadata
+
+    def _get_rich_cluster_metadata(self, subgraph: nx.Graph, cluster_id: str, parent_component_id: str, is_refined: bool) -> Dict[str, Any]:
+        """Analyzes a subgraph (representing a cluster) to extract rich metadata."""
+        nodes = list(subgraph.nodes)
         
-        clusters.sort(key=len, reverse=True)
+        # Centrality helps find the "most important" table in a cluster
+        try:
+            centrality = nx.degree_centrality(subgraph)
+            central_table = max(centrality, key=centrality.get)
+        except ValueError:
+            central_table = nodes[0] if nodes else None
         
-        self._clusters = clusters
-        
-        logger.info(f"Clustering complete. Found {len(self._clusters)} clusters.")
-        for i, cluster in enumerate(self._clusters, 1):
-            logger.info(f"  Cluster {i}: {len(cluster)} tables - {cluster[0]}...")
-        
-        return self._clusters
-    
-    def get_cluster_statistics(self) -> Dict[str, Any]:
-        """
-        Get statistics about the clustering results. Uses cached results if available.
-        
-        Returns:
-            Dict containing clustering statistics.
-        """
-        clusters = self.cluster_tables()
-        
-        if not clusters:
-            return {
-                "total_tables": len(self._tables_data),
-                "total_clusters": 0,
-                "largest_cluster_size": 0,
-                "singleton_clusters": 0
-            }
-        
-        cluster_sizes = [len(cluster) for cluster in clusters]
-        
+        density = nx.density(subgraph)
+
+        density_label = "Low"
+        if density >= 0.75:
+            density_label = "Very High (Clique-like)"
+        elif density >= 0.5:
+            density_label = "High (Tightly Coupled)"
+        elif density >= 0.25:
+            density_label = "Medium (Related)"
+
         return {
-            "total_tables": len(self._tables_data),
-            "total_clusters": len(clusters),
-            "largest_cluster_size": max(cluster_sizes),
-            "singleton_clusters": sum(1 for size in cluster_sizes if size == 1)
+            "cluster_id": cluster_id,
+            "parent_component_id": parent_component_id,
+            "size": len(nodes),
+            "tables": sorted(nodes),
+            "density_value": round(density, 2),
+            "density_label": density_label,
+            "central_table": central_table,
+            "is_singleton": len(nodes) == 1,
+            "was_refined": is_refined
         }
-
-
-# Example usage  for easy testing.
-'''
-if __name__ == "__main__":
-    # --- ADDED: A basic logging config for standalone testing ---
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-    )
-    
-    sample_tables = [
-        # ... (sample data) ...
-    ]
-    
-    service = ClusteringService(sample_tables)
-
-    # First call - will compute
-    print("\\n--- First Call ---")
-    clusters_first_run = service.cluster_tables()
-    print(f"Clusters: {clusters_first_run}")
-
-    # Second call - will be instant from cache
-    print("\\n--- Second Call (from cache) ---")
-    clusters_second_run = service.cluster_tables()
-    print(f"Clusters: {clusters_second_run}")
-    
-    stats = service.get_cluster_statistics()
-    print(f"\\nStatistics: {stats}")
-'''
