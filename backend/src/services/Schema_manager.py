@@ -888,7 +888,6 @@ class SchemaManager:
             "relationships": relationships
         }
     
-
     def get_tables_for_clustering(self) -> List[Dict[str, Any]]:
         """
         Extracts only the essential information from the schema needed for
