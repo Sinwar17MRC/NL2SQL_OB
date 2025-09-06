@@ -1,18 +1,17 @@
 """
-RAG Service for Natural Language to SQL (NL2SQL) Application
-
 This module provides a RAGService class that manages a vector knowledge base
 built from database schemas. It supports both indexing (onboarding phase) and
 searching (live query phase) operations using sentence-transformers and ChromaDB.
 """
 
 import logging
-import os
+import os, re
 from typing import Any, Dict, List, Optional
+import torch
 
 import chromadb
 from chromadb.config import Settings
-from langchain.embeddings import HuggingFaceEmbeddings
+from sentence_transformers import SentenceTransformer
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -21,8 +20,6 @@ logger = logging.getLogger(__name__)
 
 class RAGService:
     """
-    A service for managing vector-based retrieval of database schema information.
-    
     This class handles the creation and querying of a vector index built from
     database schema information. It uses sentence-transformers for embeddings
     and ChromaDB for vector storage, with each database connection isolated
@@ -55,39 +52,29 @@ class RAGService:
         project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
         self.db_path = os.path.join(project_root, 'rag_db')
         
-        # Initialize embedding model
-        logger.info("Loading embedding model 'intfloat/e5-base-multilingual'...")
+        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        model_name = "google/embeddinggemma-300m"
+        logger.info(f"Loading embedding model '{model_name}' onto device: '{self.device}'...")
         try:
-            self.embedding_model = HuggingFaceEmbeddings(
-                model_name="intfloat/e5-base-multilingual"
-            )
+            self.embedding_model = SentenceTransformer(model_name, device=self.device)
             logger.info("Successfully loaded embedding model")
         except Exception as e:
             logger.error(f"Failed to load embedding model: {e}")
             raise RuntimeError(f"Failed to initialize embedding model: {e}")
         
-        # Initialize ChromaDB client
-        logger.info(f"Initializing ChromaDB persistent client at '{db_path}'...")
+        # Initialize ChromaDB client 
+        logger.info(f"Initializing ChromaDB persistent client at '{self.db_path}'...")
         try:
-            # Ensure the database directory exists
-            os.makedirs(db_path, exist_ok=True)
-            
+            os.makedirs(self.db_path, exist_ok=True)
             self.client = chromadb.PersistentClient(
-                path=db_path,
-                settings=Settings(
-                    anonymized_telemetry=False,
-                    allow_reset=True
-                )
+                path=self.db_path,
+                settings=Settings(anonymized_telemetry=False, allow_reset=True)
             )
-            
-            # Get or create collection for this connection
             self.collection = self.client.get_or_create_collection(
                 name=self.connection_id,
                 metadata={"description": f"Schema index for connection {self.connection_id}"}
             )
-            
             logger.info(f"Successfully initialized collection '{self.connection_id}'")
-            
         except Exception as e:
             logger.error(f"Failed to initialize ChromaDB: {e}")
             raise RuntimeError(f"Failed to initialize vector database: {e}")
@@ -117,7 +104,6 @@ class RAGService:
         schema_name = table_schema.get('schema', '')
         full_table_id = f"{schema_name}.{table_name}"
         
-        # Start with most important information
         document_parts = []
         
         # Table identification (highest priority)
@@ -176,6 +162,7 @@ class RAGService:
         logger.debug(f"Built document for table '{full_table_id}' ({len(document)} characters)")
         return document
     
+    # look into the deleting of the existing data in collection
     def create_index(self, final_enriched_schema: Dict[str, Any]) -> None:
         """
         Create a vector index from the enriched database schema.
@@ -197,13 +184,12 @@ class RAGService:
             
         logger.info(f"Starting index creation for {len(tables_list)} tables...")
 
-        # --- Implement batch processing for efficiency ---
         documents = []
         metadatas = []
         ids = []
 
         for table_data in tables_list:
-            # The full_table_id is the unique identifier for our vector store
+            # The full_table_id is the unique identifier for the vector store
             full_table_id = f"{table_data.get('schema', '')}.{table_data.get('table_name', '')}"
             
             # Build the rich document for embedding
@@ -211,28 +197,41 @@ class RAGService:
             documents.append(doc)
             
             # Store essential info in metadata for quick retrieval
-            hints_str = ", ".join(table_schema.get('business_hints', []))
+            hints_str = ", ".join(table_data.get('business_hints', []))
             
             metadata = {
                 'full_table_id': full_table_id,
-                'table_name': table_schema.get('table_name', ''),
-                'schema_name': table_schema.get('schema', ''),
-                'column_count': len(table_schema.get('columns', [])),
-                'row_count': table_schema.get('row_count', 0),
-                'business_hints': hints_str # Store as a comma-separated string
+                'table_name': table_data.get('table_name', ''),
+                'schema_name': table_data.get('schema', ''),
+                'column_count': len(table_data.get('columns', [])),
+                'row_count': table_data.get('row_count', 0),
+                'business_hints': hints_str
             }
             metadatas.append(metadata)
             
-            # The ID for each vector must be unique
             ids.append(full_table_id)
 
         if not documents:
             logger.warning("No documents were generated for indexing.")
             return
 
-        # Add all prepared documents to the collection in a single, efficient batch
         try:
+            # generate embeddings for GPU usage
+            logger.info(f"Generating embeddings for {len(documents)} documents on device '{self.device}'...")
+            embeddings = self.embedding_model.encode(
+                documents,
+                show_progress_bar=True,
+                device=self.device
+            ).tolist()
+
+            # Clear existing data for idempotency 
+            if self.collection.count() > 0:
+                logger.info(f"Clearing {self.collection.count()} existing documents from collection...")
+                self.collection.delete(ids=self.collection.get()['ids'])
+
+            # Add all prepared documents to the collection in a single batch
             self.collection.add(
+                embeddings=embeddings, 
                 documents=documents,
                 metadatas=metadatas,
                 ids=ids
@@ -242,7 +241,7 @@ class RAGService:
             logger.error(f"Failed to add documents to ChromaDB collection: {e}")
             raise RuntimeError(f"Indexing process failed: {e}")
 
-    def search(self, user_question: str, k: int = 5) -> List[Dict[str, Any]]:
+    def search(self, user_question: str, k: int = 8) -> List[Dict[str, Any]]:
         """
         Search the vector index for relevant tables based on user question.
         
@@ -271,51 +270,85 @@ class RAGService:
             raise ValueError("k must be a positive integer")
         
         user_question = user_question.strip()
-        logger.info(f"Searching for relevant tables for question: '{user_question[:100]}...'")
+        logger.info(f"Performing hybrid search for question: '{user_question[:100]}...'")
 
         try:
-            # Generate query embedding
-            logger.debug("Generating query embedding...")
-            query_embedding = self.embedding_model.encode(
-                [user_question],
-                convert_to_numpy=True
-            ).tolist()
-            
-            # Search in ChromaDB
-            logger.debug(f"Querying ChromaDB for top {k} results...")
-            results = self.collection.query(
-                query_embeddings=query_embedding,
-                n_results=min(k, self.collection.count()),  # Don't request more than available
+            # Hybrid Search Logic
+
+            # 1. Semantic (Vector) Search
+            logger.debug("Performing semantic search...")
+            query_embedding = self.embedding_model.encode(user_question, device=self.device).tolist()
+            semantic_results = self.collection.query(
+                query_embeddings=[query_embedding],
+                n_results=k,
                 include=['documents', 'metadatas', 'distances']
             )
             
-            # Parse and format results
-            formatted_results = []
+            # 2. Keyword Search
+            logger.debug("Performing keyword search...")
+
+            STOPWORDS = {
+                # English
+                "the", "a", "an", "is", "are", "was", "were", "in", "on", "at", "of", 
+                "to", "for", "with", "and", "or", "by", "show", "me", "what", "which",
+                "who", "where", "when", "how", "can", "do", "does", "did", "be", "am",
+                # French
+                "le", "la", "les", "un", "une", "des", "de", "du", "au", "aux", "dans",
+                "en", "et", "ou", "par", "que", "qui", "quoi", "où", "quand", "comment",
+                "moi", "toi", "nous", "vous", "il", "elle", "ils", "elles", "ce", "cet",
+                "cette", "ces", "est", "sont", "étaient", "fut", "faire", "montre", "donne"
+            }
+
+            def extract_keywords(user_question: str):
+                # Normalize
+                text = user_question.lower()
+                # Split into words (remove punctuation)
+                words = re.findall(r"\w+", text)
+                # Remove stopwords
+                keywords = [w for w in words if w not in STOPWORDS]
+                return keywords
             
-            if results['ids'] and results['ids'][0]:  
-                ids = results['ids'][0]
-                documents = results['documents'][0] if results['documents'] else []
-                metadatas = results['metadatas'][0] if results['metadatas'] else []
-                distances = results['distances'][0] if results['distances'] else []
-                
-                for i, doc_id in enumerate(ids):
-                    result = {
-                        'id': doc_id,
-                        'document': documents[i] if i < len(documents) else '',
-                        'metadata': metadatas[i] if i < len(metadatas) else {},
-                        'distance': distances[i] if i < len(distances) else 1.0
-                    }
-                    formatted_results.append(result)
+            keywords = keywords = extract_keywords(user_question)
+            keyword_filters = [{"$contains": keyword} for keyword in keywords]
             
-            logger.info(f"Search completed. Found {len(formatted_results)} relevant tables")
+            keyword_results = self.collection.query(
+                query_texts=[user_question],
+                where_document={"$and": keyword_filters},
+                n_results=k,
+                include=['documents', 'metadatas', 'distances']
+            )
+
+            # 3. Combine and De-duplicate Results
+            final_results = {}
             
-            # Log top results 
-            for i, result in enumerate(formatted_results[:2]):
+            def process_query_results(results, source):
+                if results['ids'] and results['ids'][0]:
+                    for i, doc_id in enumerate(results['ids'][0]):
+                        if doc_id not in final_results:
+                            final_results[doc_id] = {
+                                'id': doc_id,
+                                'document': results['documents'][0][i],
+                                'metadata': results['metadatas'][0][i],
+                                'distance': results['distances'][0][i],
+                                'source': source
+                            }
+
+            process_query_results(keyword_results, 'keyword')
+            process_query_results(semantic_results, 'semantic')
+
+            # 4. Sort the combined results by distance and return top k
+            sorted_results = sorted(list(final_results.values()), key=lambda x: x['distance'])
+            
+            logger.info(f"Hybrid search completed. Found {len(sorted_results)} unique relevant tables.")
+            
+            # Log top results
+            for i, result in enumerate(sorted_results[:k]):
                 table_name = result['metadata'].get('full_table_id', result['id'])
                 distance = result['distance']
-                logger.debug(f"Result {i+1}: {table_name} (distance: {distance:.4f})")
+                source = result.get('source', 'unknown')
+                logger.debug(f"Result {i+1}: {table_name} (distance: {distance:.4f}, source: {source})")
             
-            return formatted_results
+            return sorted_results[:k]
             
         except Exception as e:
             logger.error(f"Search operation failed: {e}")
